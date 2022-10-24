@@ -19,7 +19,6 @@
 
 import asyncio
 import re
-import urllib
 import os
 import sys
 from gql import Client, gql
@@ -27,15 +26,14 @@ from email.utils import parseaddr
 from feedgen.feed import FeedGenerator
 from gql.transport.aiohttp import AIOHTTPTransport
 from random import choice, randint
-from json import loads
 from mimetypes import guess_type
 from aiohttp import ClientSession
-from quart import Quart, Response, request, redirect
-from functools import wraps
+from quart import Quart, Response, render_template, request
 from time import time
 from hashlib import sha256
 from hypercorn.config import Config
 from hypercorn.asyncio import serve
+from urllib.parse import quote
 
 GRAPHQL_URL = "https://graphql.pdm-gateway.com/graphql"
 
@@ -53,6 +51,9 @@ podcast_cache = dict()
 podcast_cache_time = 15*60 # 15 minutes
 token_timeout = 3600 * 24 * 5  # seconds = 5 days
 head_cache_time = 60 * 60 * 24  # seconds = 1 day
+
+locales = ['nl-NL', 'de-DE']
+regions = ['nl', 'de']
 
 
 def example():
@@ -101,8 +102,10 @@ def token_key(username, password):
     return key
 
 
-async def check_auth(username, password):
+async def check_auth(username, password, region, locale):
     try:
+        if len(username) == 0 or len(password) == 0:
+            return False
         if len(username) > 256 or len(password) > 256:
             return False
 
@@ -117,18 +120,17 @@ async def check_auth(username, password):
                 return True
 
         if is_correct_email_address(username):
-            # Introduce a sleep when the auth token is not yet in memory. This discourages
-            # using this server to do brute force attacks.
-            await asyncio.sleep(5)
-            preauth_token = await getPreregisterToken()
-            prereg_id = await getOnboardingId(preauth_token)
-            token = await podimoLogin(username, password, preauth_token, prereg_id)
+            preauth_token = await getPreregisterToken(region, locale)
+            prereg_id = await getOnboardingId(preauth_token, locale)
+            token = await podimoLogin(username, password, preauth_token, prereg_id, locale)
             tokens[key] = (token, time() + token_timeout)
             return True
+
     except Exception as e:
         print(f"An error occurred: {e}", file=sys.stderr)
     return False
 
+podcast_id_pattern = re.compile(r"[0-9a-fA-F\-]+")
 
 @app.route("/", methods=["POST", "GET"])
 async def index():
@@ -138,43 +140,45 @@ async def index():
         email = form.get("email")
         password = form.get("password")
         podcast_id = form.get("podcast_id")
+        region = form.get("region")
+        locale = form.get("locale")
+
         if email is None or email == "":
-            error += "Email is required<br />"
+            error += "Email is required"
         if password is None or password == "":
-            error += "Password is required<br />"
+            error += "Password is required"
         if podcast_id is None or podcast_id == "":
-            error += "Podcast ID is required<br />"
+            error += "Podcast ID is required"
+        elif podcast_id_pattern.fullmatch(podcast_id) is None:
+            error += "Podcast ID is not valid"
+        if region is None or region == "":
+            error += "Region is required"
+        elif region not in regions:
+            error += "Region is not valid"
+        if locale is None or locale == "":
+            error += "Locale is required"
+        elif locale not in locales:
+            error += "Locale is not valid"
 
         if error == "":
-            email = urllib.parse.quote(email, safe="")
-            password = urllib.parse.quote(password, safe="")
-            podcast_id = urllib.parse.quote(podcast_id, safe="")
+            email = quote(email, safe="")
+            region = quote(region, safe="")
+            locale = quote(locale, safe="")
 
-            response = f"""
-            The feed can be found at<br />
-            <p>
-            https://{email}:{password}@{HOST}/feed/{podcast_id}.xml
-            </p>
-            Copy this link into your podcast player (only works if it supports custom private RSS feeds).
-            """
-            return Response(response)
+            comma = quote(',', safe="")
+            username = f"{email}{comma}{region}{comma}{locale}"
 
-    form = f"""{error}<br />
-<form action="./" method="post">
-    <label for="email">Your Podimo email address</label><br />
-    <input type="email" required placeholder="Podimo email address" name="email"><br />
-    <br />
-    <label for="password">Your Podimo password</label><br />
-    <input type="password" required placeholder="Podimo password" name="password"><br />
-    <br />
-    <label for="podcast_id">Podcast ID (https://podimo.com/nl/shows/<b>THIS IS THE ID</b>)</label><br />
-    <input placeholder="Podcast ID" required name="podcast_id"><br />
-    <br />
-    <input type="submit" value="Create RSS URL (may take some time)" />
-</form>
-    """
-    return Response(form)
+            password = quote(password, safe="")
+            podcast_id = quote(podcast_id, safe="")
 
+            return await render_template("feed_location.html", 
+                                         username=username,
+                                         password=password,
+                                         HOST=HOST,
+                                         podcast_id=podcast_id
+            )
+
+    return await render_template("index.html", error=error, locales=locales, regions=regions)
 
 @app.errorhandler(404)
 async def not_found(error):
@@ -183,7 +187,6 @@ async def not_found(error):
     )
 
 
-id_pattern = re.compile(r"[0-9a-fA-F\-]+")
 
 @app.route("/feed/<string:podcast_id>.xml")
 async def serve_basic_auth_feed(podcast_id):
@@ -193,21 +196,34 @@ async def serve_basic_auth_feed(podcast_id):
     else:
         return await serve_feed(auth.username, auth.password, podcast_id)
 
+def split_username_region_locale(string):
+    s = string.split(',')
+    if len(s) == 3:
+        return tuple(s)
+    else:
+        return (s[0], regions[0], locales[0])
+
 @app.route("/feed/<string:username>/<string:password>/<string:podcast_id>.xml")
 async def serve_feed(username, password, podcast_id):
-    # Authenticate
-    if not await check_auth(username, password):
-        return authenticate()
-
     # Check if it is a valid podcast id string
-    if id_pattern.fullmatch(podcast_id) is None:
-        return Response("Invalid podcast id format", 404, {})
+    if podcast_id_pattern.fullmatch(podcast_id) is None:
+        return Response("Invalid podcast id format", 400, {})
+
+    username, region, locale = split_username_region_locale(username)
+    if region not in regions:
+        return Response("Invalid region", 400, {})
+    if locale not in locales:
+        return Response("Invalid locale", 400, {})
+
+    # Authenticate
+    if not await check_auth(username, password, region, locale):
+        return authenticate()
 
     # Get a list of valid podcasts
     token, _ = tokens[token_key(username, password)]
     try:
         podcasts = await podcastsToRss(
-            username, password, podcast_id, await getPodcasts(token, podcast_id)
+            podcast_id, await getPodcasts(token, podcast_id, locale), locale
         )
     except Exception as e:
         exception = str(e)
@@ -234,12 +250,12 @@ def randomFlyerId():
     return str(f"{a}-{b}")
 
 
-def generateHeaders(authorization):
+def generateHeaders(authorization, locale):
     headers = {
-        #'user-os': 'android',
-        #'user-agent': 'okhttp/4.9.1',
-        #'user-version': '2.15.3',
-        #'user-locale': 'nl-NL',
+        'user-os': 'android',
+        'user-agent': 'Podimo/2.26.9 build 461/Android 32',
+        'user-version': '2.26.9',
+        'user-locale': locale,
         "user-unique-id": randomHexId(16)
     }
     if authorization:
@@ -247,17 +263,19 @@ def generateHeaders(authorization):
     return headers
 
 
-async def getPreregisterToken():
-    t = AIOHTTPTransport(url=GRAPHQL_URL, headers=generateHeaders(None))
+# This gets the authentication token that is required for subsequent requests
+# as an anonymous user
+async def getPreregisterToken(region, locale):
+    t = AIOHTTPTransport(url=GRAPHQL_URL, headers=generateHeaders(None, locale))
     async with Client(transport=t) as client:
         query = gql(
             """
-                query AuthorizationPreregisterUser($locale: String!, $referenceUser: String, $region: String, $appsFlyerId: String) {
+                query AuthorizationPreregisterUser($locale: String!, $referenceUser: String, $countryCode: String, $appsFlyerId: String) {
                     tokenWithPreregisterUser(
                         locale: $locale
                         referenceUser: $referenceUser
-                        region: $region
-                        source: WEB
+                        countryCode: $countryCode
+                        source: MOBILE
                         appsFlyerId: $appsFlyerId
                     ) {
                         token
@@ -265,13 +283,14 @@ async def getPreregisterToken():
                 }
                 """
         )
-        variables = {"locale": "nl-NL", "region": "nl", "appsFlyerId": randomFlyerId()}
+        variables = {"locale": locale, "countryCode": region, "appsFlyerId": randomFlyerId()}
         result = await client.execute(query, variable_values=variables)
         return result["tokenWithPreregisterUser"]["token"]
 
 
-async def getOnboardingId(preauth_token):
-    t = AIOHTTPTransport(url=GRAPHQL_URL, headers=generateHeaders(preauth_token))
+# Gets an "onboarding ID" that is used during login
+async def getOnboardingId(preauth_token, locale):
+    t = AIOHTTPTransport(url=GRAPHQL_URL, headers=generateHeaders(preauth_token, locale))
     async with Client(transport=t) as client:
         query = gql(
             """
@@ -286,8 +305,8 @@ async def getOnboardingId(preauth_token):
         return result["userOnboardingFlow"]["id"]
 
 
-async def podimoLogin(username, password, preauth_token, prereg_id):
-    t = AIOHTTPTransport(url=GRAPHQL_URL, headers=generateHeaders(preauth_token))
+async def podimoLogin(username, password, preauth_token, prereg_id, locale):
+    t = AIOHTTPTransport(url=GRAPHQL_URL, headers=generateHeaders(preauth_token, locale))
     async with Client(transport=t, serialize_variables=True) as client:
         query = gql(
             """
@@ -306,7 +325,7 @@ async def podimoLogin(username, password, preauth_token, prereg_id):
         variables = {
             "email": username,
             "password": password,
-            "locale": "nl-NL",
+            "locale": locale,
             "preregisterId": prereg_id,
         }
 
@@ -314,14 +333,14 @@ async def podimoLogin(username, password, preauth_token, prereg_id):
         return result["tokenWithCredentials"]["token"]
 
 
-async def getPodcasts(token, podcast_id):
+async def getPodcasts(token, podcast_id, locale):
     if podcast_id in podcast_cache:
         result, timestamp = podcast_cache[podcast_id]
         if timestamp >= time():
             print(f"Got podcast {podcast_id} from cache ({int(timestamp-time())} seconds left)", file=sys.stderr)
             return result
 
-    t = AIOHTTPTransport(url=GRAPHQL_URL, headers=generateHeaders(token))
+    t = AIOHTTPTransport(url=GRAPHQL_URL, headers=generateHeaders(token, locale))
     async with Client(transport=t, serialize_variables=True) as client:
         query = gql(
             """
@@ -350,9 +369,16 @@ async def getPodcasts(token, podcast_id):
 
         fragment EpisodeBase on PodcastEpisode {
           id
+          artist
+          podcastName
+          imageUrl
           description
           datetime
           title
+          audio {
+            url
+            duration
+          }
           streamMedia {
             duration
             url
@@ -373,14 +399,14 @@ async def getPodcasts(token, podcast_id):
         return result
 
 
-async def urlHeadInfo(session, id, url):
+async def urlHeadInfo(session, id, url, locale):
     if id in head_cache:
         cl, ct, timestamp = head_cache[id]
         if timestamp >= time():
             return (cl, ct)
 
     async with session.head(
-        url, allow_redirects=True, headers=generateHeaders(None)
+        url, allow_redirects=True, headers=generateHeaders(None, locale)
     ) as response:
         content_length = 0
         content_type, _ = guess_type(url)
@@ -394,51 +420,78 @@ async def urlHeadInfo(session, id, url):
         return (content_length, content_type)
 
 
-async def addFeedEntry(fg, episode, session):
+def extract_audio_url(episode):
+    duration = 0
+    url = None
+    if episode['audio']:
+        url = episode['audio']['url']
+        duration = episode['audio']['duration']
+
+    if url is None or url == "":
+        if episode["streamMedia"]:
+            url = episode["streamMedia"]["url"]
+            duration = episode["streamMedia"]["duration"]
+            if "hls-media" in url and "/main.m3u8" in url:
+                url = url.replace("hls-media", "audios")
+                url = url.replace("/main.m3u8", ".mp3")
+
+    return url, duration
+
+
+async def addFeedEntry(fg, episode, session, locale):
     fe = fg.add_entry()
     fe.title(episode["title"])
     fe.description(episode["description"])
     fe.pubDate(episode["datetime"])
 
-    url = episode["streamMedia"]["url"]
-    duration = episode["streamMedia"]["duration"]
-    # I have no idea WHY Podimo has decided that their API has to be
-    # non-deterministic. It only returns a value for the URL when it feels like it,
-    # otherwise it returns an empty string. The rest of the fields are still present
-    # in the response, just the URL and duration are missing SOMETIMES
-    if url == "":
-        if episode['id'] in url_cache:
-            url, duration = url_cache[episode['id']]
-        else:
-            return
-
-    if "hls-media" in url and "/main.m3u8" in url:
-        url = url.replace("hls-media", "audios")
-        url = url.replace("/main.m3u8", ".mp3")
-
-    url_cache[episode['id']] = (url, duration)
+    url, duration = extract_audio_url(episode)
+    if url is None:
+        return 
 
     fe.podcast.itunes_duration(duration)
-    content_length, content_type = await urlHeadInfo(session, episode['id'], url)
+    content_length, content_type = await urlHeadInfo(session, episode['id'], url, locale)
     fe.enclosure(url, content_length, content_type)
 
 
-async def podcastsToRss(username, password, podcast_id, data):
+async def podcastsToRss(podcast_id, data, locale):
     fg = FeedGenerator()
     fg.load_extension("podcast")
 
     podcast = data["podcast"]
-    fg.title(podcast["title"])
-    fg.description(podcast["description"])
-    fg.link(href=f"https://podimo.com/shows/{podcast_id}", rel="alternate")
-    fg.image(podcast["images"]["coverImageUrl"])
-    fg.language(podcast["language"])
-    fg.author({"name": podcast["authorName"]})
     episodes = data["episodes"]
+
+    if len(episodes) > 0:
+        last_episode = episodes[0]
+        title = podcast["title"]
+        if podcast["title"] is None:
+            title = last_episode["podcastName"]
+        fg.title(title)
+
+        if podcast["description"]:
+            fg.description(podcast["description"])
+        else:
+            fg.description(title)
+
+        fg.link(href=f"https://podimo.com/shows/{podcast_id}", rel="alternate")
+
+        image = podcast["images"]["coverImageUrl"]
+        if image is None:
+            image = last_episode['imageUrl']
+        fg.image(image)
+
+        language = podcast["language"]
+        if language is None:
+            language = locale
+        fg.language(language)
+
+        artist = podcast["authorName"]
+        if artist is None:
+            artist = last_episode["artist"]
+        fg.author({"name": artist})
 
     async with ClientSession() as session:
         await asyncio.gather(
-            *[addFeedEntry(fg, episode, session) for episode in episodes]
+            *[addFeedEntry(fg, episode, session, locale) for episode in episodes]
         )
 
     feed = fg.rss_str(pretty=True)
