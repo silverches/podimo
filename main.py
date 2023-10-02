@@ -32,11 +32,13 @@ from hypercorn.asyncio import serve
 from urllib.parse import quote
 from podimo.config import *
 from podimo.utils import generateHeaders, randomHexId
-from podimo.proxy import spawn_local_proxy
 import podimo.cache as cache
+import cloudscraper
+import traceback
 
 # Setup Quart, used for serving the web pages
 app = Quart(__name__)
+proxies = dict()
 
 def example():
     return f"""Example
@@ -86,18 +88,19 @@ def initialize_client(username: str, password: str, region: str, locale: str) ->
     client.cookie_jar = cache.cookie_jars[key]
     return client
 
-async def check_auth(username, password, region, locale):
+async def check_auth(username, password, region, locale, scraper):
     try:
         client = initialize_client(username, password, region, locale)
         if client.token:
             return client
 
-        await client.podimoLogin()
+        await client.podimoLogin(scraper)
         cache.insertIntoTokenCache(client.key, client.token)
         return client
 
     except Exception as e:
         print(f"An error occurred: {e}", file=sys.stderr)
+        traceback.print_exc()
     return None
 
 podcast_id_pattern = re.compile(r"[0-9a-fA-F\-]+")
@@ -123,7 +126,7 @@ async def index():
             error += "Podcast ID is not valid"
         if region is None or region == "":
             error += "Region is required"
-        elif region not in REGIONS:
+        elif region not in [region_code for (region_code, _) in REGIONS]:
             error += "Region is not valid"
         if locale is None or locale == "":
             error += "Locale is required"
@@ -174,7 +177,7 @@ def split_username_region_locale(string):
     if len(s) == 3:
         return tuple(s)
     else:
-        return (s[0], REGIONS[0], LOCALES[0])
+        return (s[0], 'nl', 'nl-NL')
 
 
 def token_key(username, password):
@@ -191,29 +194,31 @@ async def serve_feed(username, password, podcast_id):
         return Response("Invalid podcast id format", 400, {})
 
     username, region, locale = split_username_region_locale(username)
-    if region not in REGIONS:
+    if region not in [region_code for (region_code, _) in REGIONS]:
         return Response("Invalid region", 400, {})
     if locale not in LOCALES:
         return Response("Invalid locale", 400, {})
 
-    client = await check_auth(username, password, region, locale)
-    if not client:
-        return authenticate()
+    with cloudscraper.create_scraper() as scraper:
+        scraper.proxies = proxies
+        client = await check_auth(username, password, region, locale, scraper)
+        if not client:
+            return authenticate()
 
-    # Get a list of valid podcasts
-    try:
-        podcasts = await podcastsToRss(
-            podcast_id, await client.getPodcasts(podcast_id), locale
-        )
-    except Exception as e:
-        exception = str(e)
-        if "Podcast not found" in exception:
-            return Response(
-                "Podcast not found. Are you sure you have the correct ID?", 404, {}
+        # Get a list of valid podcasts
+        try:
+            podcasts = await podcastsToRss(
+                podcast_id, await client.getPodcasts(podcast_id, scraper), locale
             )
-        print(f"Error while fetching podcasts: {exception}", file=sys.stderr)
-        return Response("Something went wrong while fetching the podcasts", 500, {})
-    return Response(podcasts, mimetype="text/xml")
+        except Exception as e:
+            exception = str(e)
+            if "Podcast not found" in exception:
+                return Response(
+                    "Podcast not found. Are you sure you have the correct ID?", 404, {}
+                )
+            print(f"Error while fetching podcasts: {exception}", file=sys.stderr)
+            return Response("Something went wrong while fetching the podcasts", 500, {})
+        return Response(podcasts, mimetype="text/xml")
 
 
 async def urlHeadInfo(session, id, url, locale):
@@ -223,7 +228,7 @@ async def urlHeadInfo(session, id, url, locale):
 
     print("HEAD request to", url, file=sys.stderr)
     async with session.head(
-        url, allow_redirects=True, headers=generateHeaders(None, locale)
+        url, allow_redirects=True, headers=generateHeaders(None, locale), timeout=3.05
     ) as response:
         content_length = 0
         content_type, _ = guess_type(url)
@@ -322,18 +327,20 @@ async def podcastsToRss(podcast_id, data, locale):
 async def spawn_web_server():
     config = Config()
     config.bind = [PODIMO_BIND_HOST]
+    config.read_timeout = 60
+    config.graceful_timeout = 5
+    config.backlog = 1000
     app.config['TEMPLATES_AUTO_RELOAD'] = True
     await serve(app, config)
 
-async def main(proxy):
+async def main():
+    if getenv("HTTP_PROXY"):
+        global proxies
+        print(f"Running with https proxy defined in environmental variable HTTP_PROXY: {getenv('HTTP_PROXY')}")
+        proxies['https'] = getenv("HTTP_PROXY")
     tasks = [spawn_web_server()]
-    if proxy:
-        tasks.append(spawn_local_proxy(proxy))
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
     print(f"Spawning server on {PODIMO_BIND_HOST}")
-    proxy = getenv("HTTP_PROXY")
-    if proxy:
-        print(f"Spawning local proxy on {LOCAL_PROXY_URL} to proxy to {proxy}")
-    asyncio.run(main(proxy))
+    asyncio.run(main())
