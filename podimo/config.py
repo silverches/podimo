@@ -18,33 +18,49 @@
 # permissions and limitations under the Licence.
 
 import os
+import logging
+from dotenv import dotenv_values
 
-# You can overwrite the following three values with environmental variables
+# Load variables from the `.env` file first,
+# and overwrite them with environment variables
+config = {
+    **dotenv_values(".env"),
+    **os.environ
+}
+
+# You can overwrite the following four values with environmental variables
 # - `PODIMO_HOSTNAME`: the hostname that is displayed to the user.
 #                      This defaults to "podimo.thijs.sh".
 # - `PODIMO_BIND_HOST`: to what IP and port the Python webserver should bind.
 #                       Defaults to "127.0.0.1:12104"
 # - `PODIMO_PROTOCOL`: what protocol is being used for all links that are
 #                      displayed to the user. Defaults to "https".
-PODIMO_HOSTNAME = os.environ.get("PODIMO_HOSTNAME", "podimo.thijs.sh")
-PODIMO_BIND_HOST = os.environ.get("PODIMO_BIND_HOST", "127.0.0.1:12104")
-PODIMO_PROTOCOL = os.environ.get("PODIMO_PROTOCOL", "https")
+PODIMO_HOSTNAME = str(config.get("PODIMO_HOSTNAME", "localhost:12104"))
+PODIMO_BIND_HOST = str(config.get("PODIMO_BIND_HOST", "127.0.0.1:12104"))
+PODIMO_PROTOCOL = str(config.get("PODIMO_PROTOCOL", "http"))
+HTTP_PROXY = config.get("HTTP_PROXY", None)
+ZENROWS_API = config.get("ZENROWS_API", None)
+SCRAPER_API = config.get("SCRAPER_API", None)
+CACHE_DIR = os.path.abspath(str(config.get("CACHE_DIR", "./cache")))
 
 # Enable extra logging in debugging mode
-DEBUG = os.environ.get("DEBUG", False)
+DEBUG = bool(str(config.get("DEBUG", None)).lower() in ['true', '1', 't', 'y', 'yes'])
 
 # Podimo's API uses GraphQL. This variable defines the endpoint where
 # the API can be found.
 GRAPHQL_URL = "https://podimo.com/graphql"
 
+# Whether login tokens should be cached on disk, or only in memory
+STORE_TOKENS_ON_DISK = bool(str(config.get("STORE_TOKENS_ON_DISK", True)).lower() in ['true', '1', 't', 'y', 'yes'])
+
 # The time that a token is stored in cache
-TOKEN_TIMEOUT = 3600 * 24 * 5  # seconds = 5 days
+TOKEN_CACHE_TIME = int(config.get("TOKEN_CACHE_TIME", 3600 * 24 * 5))  # seconds = 5 days by default
 
 # The time that a podcast feed is stored in cache
-PODCAST_CACHE_TIME = 15 * 60 # seconds = 15 minutes
+PODCAST_CACHE_TIME = int(config.get("PODCAST_CACHE_TIME", "21600"))  # Default = 3600 * 6 = 6 hours
 
 # The time that the content information is cached
-HEAD_CACHE_TIME = 7 * 60 * 60 * 24  # seconds = 7 days
+HEAD_CACHE_TIME = int(config.get("HEAD_CACHE_TIME", 7 * 60 * 60 * 24))  # seconds = 7 days by default
 
 LOCALES = [
         'nl-NL',
@@ -69,3 +85,14 @@ REGIONS = [
         ('fi', 'Suomi'),
         ('uk', 'United Kingdom')
 ]
+
+# If DEBUG mode is enabled, modify the logging output
+log_level = logging.INFO
+if DEBUG:
+    log_level = logging.DEBUG
+
+logging.basicConfig(
+    format="%(levelname)s | %(asctime)s | %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%SZ",
+    level=log_level
+)

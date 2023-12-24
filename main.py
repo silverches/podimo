@@ -20,6 +20,7 @@
 import asyncio
 import re
 import sys
+import logging
 from os import getenv
 from podimo.client import PodimoClient
 from feedgen.feed import FeedGenerator
@@ -39,6 +40,13 @@ import traceback
 # Setup Quart, used for serving the web pages
 app = Quart(__name__)
 proxies = dict()
+
+#Setup logging
+logging.basicConfig(
+    format="%(levelname)s | %(asctime)s | %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%SZ",
+    level=logging.INFO,
+)
 
 def example():
     return f"""Example
@@ -99,7 +107,7 @@ async def check_auth(username, password, region, locale, scraper):
         return client
 
     except Exception as e:
-        print(f"An error occurred: {e}", file=sys.stderr)
+        logging.error(f"An error occurred: {e}")
         if DEBUG:
             traceback.print_exc()
     return None
@@ -217,7 +225,7 @@ async def serve_feed(username, password, podcast_id):
                 return Response(
                     "Podcast not found. Are you sure you have the correct ID?", 404, {}
                 )
-            print(f"Error while fetching podcasts: {exception}", file=sys.stderr)
+            logging.error(f"Error while fetching podcasts: {exception}")
             return Response("Something went wrong while fetching the podcasts", 500, {})
         return Response(podcasts, mimetype="text/xml")
 
@@ -227,7 +235,7 @@ async def urlHeadInfo(session, id, url, locale):
     if entry:
         return entry
 
-    print("HEAD request to", url, file=sys.stderr)
+    logging.debug(f"HEAD request to {url}")
     async with session.head(
         url, allow_redirects=True, headers=generateHeaders(None, locale), timeout=3.05
     ) as response:
@@ -335,13 +343,28 @@ async def spawn_web_server():
     await serve(app, config)
 
 async def main():
-    if getenv("HTTP_PROXY"):
+    if HTTP_PROXY:
         global proxies
-        print(f"Running with https proxy defined in environmental variable HTTP_PROXY: {getenv('HTTP_PROXY')}")
-        proxies['https'] = getenv("HTTP_PROXY")
+        logging.info(f"Running with https proxy defined in environmental variable HTTP_PROXY: {HTTP_PROXY}")
+        proxies['https'] = HTTP_PROXY
     tasks = [spawn_web_server()]
     await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
-    print(f"Spawning server on {PODIMO_BIND_HOST}")
+    if DEBUG:
+        logging.info(f"""Spawning server on {PODIMO_BIND_HOST}
+Configuration: 
+- DEBUG: {DEBUG}
+- PODIMO_HOSTNAME: {PODIMO_HOSTNAME}
+- PODIMO_BIND_HOST: {PODIMO_BIND_HOST}
+- PODIMO_PROTOCOL: {PODIMO_PROTOCOL}
+- HTTP_PROXY: {HTTP_PROXY}
+- ZENROWS_API: {ZENROWS_API}
+- SCRAPER_API: {SCRAPER_API}
+- CACHE_DIR: {CACHE_DIR}
+- STORE_TOKENS_ON_DISK: {STORE_TOKENS_ON_DISK}
+- TOKEN_CACHE_TIME: {TOKEN_CACHE_TIME} sec
+- PODCAST_CACHE_TIME: {PODCAST_CACHE_TIME} sec
+- HEAD_CACHE_TIME: {HEAD_CACHE_TIME} sec
+""")
     asyncio.run(main())
